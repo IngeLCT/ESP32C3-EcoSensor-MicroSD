@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mdns.h"
+#include "lwip/ip4_addr.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -43,6 +44,8 @@ static void shutdown_ap_http(void);
 static void start_mdns_service(void);
 static bool in_boot_grace_window(void);
 static void start_with_saved_or_manager(void);
+static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out);
+static esp_err_t apply_saved_sta_ip_config(void);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -148,6 +151,50 @@ static esp_err_t start_ap(void) {
     return ESP_OK;
 }
 
+static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out) {
+    if (!text || !out || !ip4addr_aton(text, (ip4_addr_t *)out)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t apply_saved_sta_ip_config(void) {
+    if (!g_sta_netif) return ESP_ERR_INVALID_STATE;
+
+    wifi_static_ip_cfg_t cfg = {0};
+    esp_err_t err = wifi_store_load_static_ip_cfg(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "No se pudo leer config IP estática: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (!cfg.enabled) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcpc_stop(g_sta_netif));
+        err = esp_netif_dhcpc_start(g_sta_netif);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGW(TAG, "No se pudo iniciar DHCP cliente: %s", esp_err_to_name(err));
+            return err;
+        }
+        ESP_LOGI(TAG, "STA usando DHCP");
+        return ESP_OK;
+    }
+
+    esp_netif_ip_info_t ip_info = {0};
+    ip4addr_aton("255.255.255.0", (ip4_addr_t *)&ip_info.netmask);
+    if (parse_ipv4_or_fail(cfg.ip, &ip_info.ip) != ESP_OK ||
+        parse_ipv4_or_fail(cfg.gateway, &ip_info.gw) != ESP_OK) {
+        ESP_LOGE(TAG, "Configuración IP estática inválida en NVS");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcpc_stop(g_sta_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(g_sta_netif, &ip_info));
+
+    ESP_LOGI(TAG, "STA usando IP estática: ip=%s mask=255.255.255.0 gw=%s",
+             cfg.ip, cfg.gateway);
+    return ESP_OK;
+}
+
 static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
     wifi_config_t sta_cfg = {0};
     snprintf((char*)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", ssid);
@@ -155,6 +202,7 @@ static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(apply_saved_sta_ip_config());
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     set_state(CAP_STATE_CONNECTING);
     g_sta_have_ip = false;
@@ -235,41 +283,7 @@ static esp_err_t root_get(httpd_req_t *r)
     httpd_resp_set_hdr(r, "Expires", "0");
     httpd_resp_set_hdr(r, "Connection", "close");
 
-    char ubic[64] = {0};
-    if (wifi_store_get_location(ubic, sizeof(ubic)) != ESP_OK) {
-        ubic[0] = '\0';
-    }
-
-    char ubic_escaped[96];
-    size_t j = 0;
-    for (size_t i = 0; ubic[i] && j < sizeof(ubic_escaped) - 1; ++i) {
-        if (ubic[i] == '"') {
-            if (j + 6 < sizeof(ubic_escaped)) {
-                memcpy(&ubic_escaped[j], "&quot;", 6);
-                j += 6;
-            } else break;
-        } else if (ubic[i] == '&') {
-            if (j + 5 < sizeof(ubic_escaped)) {
-                memcpy(&ubic_escaped[j], "&amp;", 5);
-                j += 5;
-            } else break;
-        } else if (ubic[i] == '<') {
-            if (j + 4 < sizeof(ubic_escaped)) {
-                memcpy(&ubic_escaped[j], "&lt;", 4);
-                j += 4;
-            } else break;
-        } else if (ubic[i] == '>') {
-            if (j + 4 < sizeof(ubic_escaped)) {
-                memcpy(&ubic_escaped[j], "&gt;", 4);
-                j += 4;
-            } else break;
-        } else {
-            ubic_escaped[j++] = ubic[i];
-        }
-    }
-    ubic_escaped[j] = '\0';
-
-    const char *head =
+    const char *page =
         "<!doctype html><html lang=\"es\"><head>"
         "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>EcoSensor Wi-Fi Manager</title>"
@@ -280,6 +294,10 @@ static esp_err_t root_get(httpd_req_t *r)
         "h1{font-size:20px;margin:0 0 12px}"
         "label{display:block;font-weight:600;margin:16px 0 6px}"
         "select,input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #dcdfe6;border-radius:10px;font-size:14px}"
+        ".row-check{display:flex;align-items:center;gap:10px;margin-top:18px}"
+        ".row-check input{width:auto;margin:0}"
+        ".row-check label{margin:0;font-weight:600}"
+        ".ip-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}"
         "button,input[type=submit]{margin-top:18px;border:0;border-radius:12px;padding:12px 16px;cursor:pointer;font-weight:600}"
         "input[type=submit]{background:#111;color:#fff}"
         "</style></head><body><div class=\"wrap\"><div class=\"card\">"
@@ -290,11 +308,14 @@ static esp_err_t root_get(httpd_req_t *r)
         "<select id=\"ssid\" name=\"ssid\" required><option value=\"\" disabled selected>Cargando redes...</option></select>"
         "<label for=\"pass\">Contraseña</label>"
         "<input type=\"password\" id=\"pass\" name=\"pass\">"
-        "<label for=\"ubic\">Ubicación</label>"
-        "<input type=\"text\" id=\"ubic\" name=\"ubic\" placeholder=\"Ej. Taller / Sala 1\" value=\"";
-
-    const char *tail =
-        "\">"
+        "<div class=\"row-check\"><input type=\"checkbox\" id=\"use_static_ip\" name=\"use_static_ip\"><label for=\"use_static_ip\">Configurar IP manual</label></div>"
+        "<div class=\"ip-grid\">"
+        "<div><label for=\"static_ip\">IP</label><input type=\"text\" id=\"static_ip\" name=\"static_ip\" placeholder=\"192.168.1.50\" disabled></div>"
+        "<div><label for=\"subnet\">Máscara</label><input type=\"text\" id=\"subnet\" name=\"subnet\" placeholder=\"255.255.255.0\" disabled></div>"
+        "<div><label for=\"gateway\">Gateway</label><input type=\"text\" id=\"gateway\" name=\"gateway\" placeholder=\"192.168.1.1\" disabled></div>"
+        "<div><label for=\"dns1\">DNS primario</label><input type=\"text\" id=\"dns1\" name=\"dns1\" placeholder=\"8.8.8.8\" disabled></div>"
+        "<div><label for=\"dns2\">DNS secundario (opcional)</label><input type=\"text\" id=\"dns2\" name=\"dns2\" placeholder=\"1.1.1.1\" disabled></div>"
+        "</div>"
         "<input type=\"submit\" value=\"Guardar y reiniciar\">"
         "</form>"
         "</div></div>"
@@ -316,7 +337,7 @@ static esp_err_t root_get(httpd_req_t *r)
         "sel.appendChild(o);"
         "}"
         "sel.selectedIndex=0;applyPassDisable();"
-        "}else{sel.innerHTML='<option value=\"\">(No se encontraron redes)</option>';document.getElementById('pass').disabled=false;}"
+        "}else{sel.innerHTML='<option value=\\\"\\\">(No se encontraron redes)</option>';document.getElementById('pass').disabled=false;}"
         "}catch(e){console.error('Error cargando redes:',e);}"
         "}"
         "function applyPassDisable(){"
@@ -327,34 +348,30 @@ static esp_err_t root_get(httpd_req_t *r)
         "pass.disabled=isOpen;"
         "if(isOpen){pass.value='';pass.placeholder='Esta red no requiere contraseña';}else{pass.placeholder=' ';}"
         "}"
+        "function applyStaticIpToggle(){"
+        "const enabled=document.getElementById('use_static_ip').checked;"
+        "['static_ip','gateway'].forEach(id=>{document.getElementById(id).disabled=!enabled;});"
+        "}"
         "document.getElementById('ssid').addEventListener('change',applyPassDisable);"
+        "document.getElementById('use_static_ip').addEventListener('change',applyStaticIpToggle);"
         "document.getElementById('wifiForm').addEventListener('submit',async(ev)=>{"
         "ev.preventDefault();"
         "const ssid=document.getElementById('ssid').value||'';"
         "const pass=document.getElementById('pass').value||'';"
-        "const ubic=document.getElementById('ubic').value||'';"
+        "const use_static_ip=document.getElementById('use_static_ip').checked;"
+        "const static_ip=document.getElementById('static_ip').value||'';"
+        "const gateway=document.getElementById('gateway').value||'';"
+        "if(use_static_ip && (!static_ip || !gateway)){alert('Para IP manual debes completar IP y gateway.');return;}"
         "try{"
-        "const resp=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pass,ubic})});"
+        "const resp=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pass,use_static_ip,static_ip,gateway})});"
         "const txt=await resp.text();"
         "alert(txt||'Guardado. Reiniciando...');"
         "}catch(e){alert('Error guardando: '+(e&&e.message?e.message:e));}"
         "});"
-        "window.addEventListener('load',()=>{loadNetworks();});"
+        "window.addEventListener('load',()=>{loadNetworks();applyStaticIpToggle();});"
         "</script></body></html>";
 
-    size_t total = strlen(head) + strlen(ubic_escaped) + strlen(tail) + 1;
-    char *page = (char*)malloc(total);
-    if (!page) {
-        return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
-
-    strcpy(page, head);
-    strcat(page, ubic_escaped);
-    strcat(page, tail);
-
-    esp_err_t er = httpd_resp_send(r, page, HTTPD_RESP_USE_STRLEN);
-    free(page);
-    return er;
+    return httpd_resp_send(r, page, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t save_post(httpd_req_t *r) {
@@ -368,7 +385,9 @@ static esp_err_t save_post(httpd_req_t *r) {
 
     cJSON *js = cJSON_GetObjectItem(root, "ssid");
     cJSON *jp = cJSON_GetObjectItem(root, "pass");
-    cJSON *ju = cJSON_GetObjectItem(root, "ubic");
+    cJSON *j_use_static_ip = cJSON_GetObjectItem(root, "use_static_ip");
+    cJSON *j_static_ip = cJSON_GetObjectItem(root, "static_ip");
+    cJSON *j_gateway = cJSON_GetObjectItem(root, "gateway");
     if (!cJSON_IsString(js)) {
         cJSON_Delete(root);
         return httpd_resp_send_err(r, 400, "ssid?");
@@ -376,10 +395,41 @@ static esp_err_t save_post(httpd_req_t *r) {
 
     const char *ssid = js->valuestring;
     const char *pass = (jp && cJSON_IsString(jp)) ? jp->valuestring : "";
+    bool use_static_ip = cJSON_IsTrue(j_use_static_ip);
 
-    wifi_store_save(ssid, pass);
-    if (ju && cJSON_IsString(ju)) {
-        wifi_store_set_location(ju->valuestring);
+    wifi_static_ip_cfg_t ip_cfg = {0};
+    ip_cfg.enabled = use_static_ip;
+    if (use_static_ip) {
+        const char *static_ip = (j_static_ip && cJSON_IsString(j_static_ip)) ? j_static_ip->valuestring : "";
+        const char *gateway = (j_gateway && cJSON_IsString(j_gateway)) ? j_gateway->valuestring : "";
+
+        if (!static_ip[0] || !gateway[0]) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(r, 400, "static ip fields missing");
+        }
+        if (strlen(static_ip) >= sizeof(ip_cfg.ip) || strlen(gateway) >= sizeof(ip_cfg.gateway)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(r, 400, "static ip field too long");
+        }
+
+        strcpy(ip_cfg.ip, static_ip);
+        strcpy(ip_cfg.gateway, gateway);
+
+        esp_ip4_addr_t tmp = {0};
+        if (parse_ipv4_or_fail(ip_cfg.ip, &tmp) != ESP_OK ||
+            parse_ipv4_or_fail(ip_cfg.gateway, &tmp) != ESP_OK) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(r, 400, "invalid static ip config");
+        }
+    }
+
+    esp_err_t err = wifi_store_save(ssid, pass);
+    if (err == ESP_OK) {
+        err = wifi_store_save_static_ip_cfg(&ip_cfg);
+    }
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 500, "save failed");
     }
 
     httpd_resp_sendstr(r, "Datos guardados. El dispositivo se reiniciará para conectar a la red.");
