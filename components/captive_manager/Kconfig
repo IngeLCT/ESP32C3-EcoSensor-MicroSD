@@ -11,21 +11,9 @@ menu "Captive Manager"
         string "AP password temporal (>=8 chars para WPA2)"
         default "esp32login"
 
-    config CAPTIVE_MANAGER_CONNECTIVITY_URL
-        string "URL de verificación de conectividad"
-        default "http://connectivitycheck.gstatic.com/generate_204"
-
-    config CAPTIVE_MANAGER_CHECK_INTERVAL_MS
-        int "Intervalo (ms) entre chequeos de conectividad"
-        default 7000
-
-    config CAPTIVE_MANAGER_VERIFY_SUCCESS_N
-        int "Éxitos consecutivos requeridos para confirmar internet"
-        default 2
-
     config CAPTIVE_MANAGER_MAX_SCAN_APS
         int "Máximo de APs listados en /scan"
-        default 30
+        default 20
 
     config CAPTIVE_MANAGER_CONN_MAX_ATTEMPTS
         int "Máx. reintentos conexión con credenciales guardadas"
@@ -35,11 +23,7 @@ menu "Captive Manager"
         int "Delay (ms) entre reintentos guardados"
         default 4000
 
-    config CAPTIVE_MANAGER_STARTUP_CHECK_DELAY_MS
-        int "Delay inicial (ms) antes del primer chequeo tras IP guardada"
-        default 1500
-
     config CAPTIVE_MANAGER_BOOT_GRACE_MS
-        int "Ventana de gracia tras arranque (ms) antes de entrar a recaptive"
+        int "Ventana de gracia tras arranque (ms) antes de volver al Wi-Fi manager"
         default 180000
 endmenu

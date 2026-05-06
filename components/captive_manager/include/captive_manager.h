@@ -20,13 +20,9 @@ typedef enum {
 typedef struct {
     const char *ap_ssid;
     const char *ap_pass;
-    const char *connectivity_url;
-    int check_interval_ms;
-    int verify_success_needed;
     int max_scan_aps;
     int conn_max_attempts;
     int conn_retry_delay_ms;
-    int startup_check_delay_ms;
     int boot_grace_ms;
     const char *mdns_hostname;
 } captive_manager_cfg_t;
@@ -41,11 +37,6 @@ void captive_manager_notify_sta_got_ip(void);
 void captive_manager_notify_sta_disconnected(int reason_code);
 
 esp_err_t captive_manager_enter_recaptive(void);
-
-void captive_manager_enable_nat(void);
-void captive_manager_disable_nat(void);
-bool connectivity_portal_open(void);
-
 bool captive_manager_using_saved(void);
 
 #ifdef __cplusplus
